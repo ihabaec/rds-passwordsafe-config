@@ -225,6 +225,34 @@ function Invoke-PreflightChecks {
         $problems.Add("Only $freeGB GB free on $($env:SystemDrive) - below the $MinFreeDiskGB GB minimum for a safe RDS role install.")
     }
 
+    # New-RDSessionDeployment always talks to the broker over WinRM, even when broker
+    # and session host are the same box. Check that up front - the raw RDS error for
+    # this ("Unable to connect to the server by using Windows PowerShell remoting")
+    # gives no hint about the actual cause.
+    if (-not $SkipRemoteAppPublish) {
+        try {
+            Test-WSMan -ComputerName $env:COMPUTERNAME -ErrorAction Stop | Out-Null
+            Write-Host "    WinRM (PowerShell remoting) to self: OK"
+        }
+        catch {
+            $problems.Add("WinRM/PowerShell remoting to '$env:COMPUTERNAME' is not working ($($_.Exception.Message)). New-RDSessionDeployment requires this even for a single-server deployment. Run 'Enable-PSRemoting -Force' and confirm no firewall blocks TCP 5985, then re-run. Or pass -SkipRemoteAppPublish to skip deployment/collection/RemoteApp steps.")
+        }
+
+        $domain = (Get-CimInstance -ClassName Win32_ComputerSystem)
+        if ($domain.PartOfDomain) {
+            $dcTest = & nltest /dsgetdc:$($domain.Domain) 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $problems.Add("Server is domain-joined to '$($domain.Domain)' but cannot locate/reach a domain controller (nltest /dsgetdc failed). This also breaks gpupdate and WinRM-over-FQDN. Fix DNS/network connectivity to a DC before proceeding.")
+            }
+            else {
+                Write-Host "    Domain controller reachable for '$($domain.Domain)': OK"
+            }
+        }
+        else {
+            Write-Host "    Server is not domain-joined (workgroup) - gpupdate /force will always fail here; that's expected, not a script bug."
+        }
+    }
+
     if (Test-Path (Join-Path $PbpsmonPath 'pbpslaunch.exe')) {
         Write-Host "    pbpsmon tools found at $PbpsmonPath" -ForegroundColor Green
     } else {
