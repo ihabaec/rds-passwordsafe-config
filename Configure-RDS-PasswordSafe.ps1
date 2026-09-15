@@ -11,14 +11,19 @@
 
     Steps performed:
       1. Install RDS roles (Connection Broker, Session Host, Licensing) if missing
-      2. Allow multiple concurrent sessions per user (registry, matches GPO path)
-      3. Set session time limits (disconnected / active / idle) via registry
-      4. Set RemoteApp logoff delay via registry
-      5. Set max simultaneous RDS connections
-      6. Create Pbpslaunch / PSAutomate system environment variables
-      7. Run gpupdate /force
-      8. Print manual follow-up items (licensing, RDS Collection app publishing,
-         load balancer / firewall notes) that cannot be automated safely
+      2. Create the RDS session deployment (New-RDSessionDeployment) if one doesn't
+         already exist - Install-WindowsFeature alone does not create this
+      3. Create the 'PasswordSafe-<name>' RD Session Collection, and publish
+         pbpslaunch.exe / ps_automate.exe / pbpsmon.exe as RemoteApps (command-line
+         parameters allowed) for whichever of those actually exist under PbpsmonPath
+      4. Allow multiple concurrent sessions per user (registry, matches GPO path)
+      5. Set session time limits (disconnected / active / idle) via registry
+      6. Set RemoteApp logoff delay via registry
+      7. Set max simultaneous RDS connections
+      8. Create Pbpslaunch / PSAutomate system environment variables
+      9. Run gpupdate /force
+      10. Print manual follow-up items (licensing activation/CALs, load balancer /
+          firewall notes) that cannot be automated safely
 
     Safety features:
       - Pre-flight checks (Administrator, Server SKU, pending reboot, free disk space)
@@ -99,6 +104,14 @@ param(
     [ValidateSet('PerUser', 'PerDevice')]
     [string]$LicenseMode = 'PerUser',
 
+    # Name of the RD Session Collection to create/use for Password Safe RemoteApps.
+    # Auto-prefixed with "PasswordSafe-" if you don't already include it.
+    [ValidateNotNullOrEmpty()]
+    [string]$CollectionName = 'PasswordSafe-Apps',
+
+    # Skip auto-creating the RD Session Collection and publishing the pbpsmon RemoteApps.
+    [switch]$SkipRemoteAppPublish,
+
     # Do not delete this script file after it finishes running. By default the
     # script self-deletes once it completes (registry backups, rollback script,
     # and transcript in -BackupPath are never deleted - only this .ps1 file is).
@@ -109,6 +122,10 @@ $ErrorActionPreference = 'Stop'
 $script:results = New-Object System.Collections.Generic.List[pscustomobject]
 $script:touchedKeys = New-Object System.Collections.Generic.List[pscustomobject]
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+
+if ($CollectionName -notmatch '^PasswordSafe-') {
+    $CollectionName = "PasswordSafe-$CollectionName"
+}
 
 function Invoke-Step {
     param(
@@ -286,6 +303,50 @@ else {
     Write-Host "`n(Skipping RDS feature install per -SkipFeatureInstall)" -ForegroundColor DarkYellow
 }
 
+if (-not $SkipRemoteAppPublish) {
+    Invoke-Step -Name "Create RD Session Collection '$CollectionName'" -Action {
+        Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+        $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
+        $existing = Get-RDSessionCollection -CollectionName $CollectionName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Host "    Collection '$CollectionName' already exists - skipping."
+        }
+        else {
+            New-RDSessionCollection -CollectionName $CollectionName -SessionHost $fqdn -ConnectionBroker $fqdn -CollectionDescription 'BeyondTrust Password Safe application session RemoteApps' -ErrorAction Stop | Out-Null
+        }
+    }
+
+    # Publish each pbpsmon executable as a RemoteApp, only if it actually exists on disk,
+    # and only if it isn't already published (safe to re-run).
+    $remoteApps = @(
+        @{ Alias = 'pbpslaunch';  DisplayName = 'PasswordSafe - pbpslaunch';  File = 'pbpslaunch.exe' }
+        @{ Alias = 'ps_automate'; DisplayName = 'PasswordSafe - ps_automate'; File = 'ps_automate.exe' }
+        @{ Alias = 'pbpsmon';     DisplayName = 'PasswordSafe - pbpsmon';     File = 'pbpsmon.exe' }
+    )
+
+    foreach ($app in $remoteApps) {
+        $exePath = Join-Path $PbpsmonPath $app.File
+        if (-not (Test-Path $exePath)) {
+            Write-Host "`n(Skipping RemoteApp publish for $($app.File) - not found at $exePath)" -ForegroundColor DarkYellow
+            continue
+        }
+
+        Invoke-Step -Name "Publish RemoteApp: $($app.DisplayName)" -Action {
+            Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+            $existingApp = Get-RDRemoteApp -CollectionName $CollectionName -Alias $app.Alias -ErrorAction SilentlyContinue
+            if ($existingApp) {
+                Write-Host "    RemoteApp '$($app.Alias)' already published - skipping."
+            }
+            else {
+                New-RDRemoteApp -CollectionName $CollectionName -Alias $app.Alias -DisplayName $app.DisplayName -FilePath $exePath -CommandLineSetting Allow -ErrorAction Stop | Out-Null
+            }
+        }
+    }
+}
+else {
+    Write-Host "`n(Skipping RD Collection creation / RemoteApp publishing per -SkipRemoteAppPublish)" -ForegroundColor DarkYellow
+}
+
 # 2. Allow multiple concurrent sessions per user
 Invoke-Step -Name 'Allow multiple concurrent RDS sessions per user (fSingleSessionPerUser=0)' -Action {
     Set-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fSingleSessionPerUser' -Value 0
@@ -372,10 +433,11 @@ Write-Host @'
    (per-user or per-device) for this deployment. Licensing setup is outside
    BeyondTrust support scope - consult Microsoft.
 
-2. RDS Collection / RemoteApp publishing: create the RDS Collection and
-   publish ps_automate.exe, pbpslaunch.exe, and pbpsmon.exe (from
-   the PbpsmonPath above) as RemoteApp programs, with
-   "Allow command-line parameters" enabled for each.
+2. RDS Collection / RemoteApp publishing: this script auto-creates the
+   'CollectionName' session collection and publishes any of pbpslaunch.exe,
+   ps_automate.exe, pbpsmon.exe it finds under PbpsmonPath, with command-line
+   parameters allowed. If any were skipped above, it's because the .exe
+   wasn't found on disk yet (install pbpsmon/ESA first, then re-run).
 
 3. If this server sits behind a network load balancer in front of multiple
    RD Session Hosts, confirm TCP port 3389 (or your custom RDP port) is
