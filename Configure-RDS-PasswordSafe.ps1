@@ -275,9 +275,21 @@ function Invoke-PreflightChecks {
 
         $domain = (Get-CimInstance -ClassName Win32_ComputerSystem)
         if ($domain.PartOfDomain) {
-            $dcTest = & nltest /dsgetdc:$($domain.Domain) 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                $problems.Add("Server is domain-joined to '$($domain.Domain)' but cannot locate/reach a domain controller (nltest /dsgetdc failed). This also breaks gpupdate and WinRM-over-FQDN. Fix DNS/network connectivity to a DC before proceeding.")
+            # nltest writes to stderr on failure; under $ErrorActionPreference='Stop' that
+            # becomes a terminating error via 2>&1, so isolate it with its own EAP.
+            $prevEAP = $ErrorActionPreference
+            $ErrorActionPreference = 'SilentlyContinue'
+            $dcTestOutput = & nltest /dsgetdc:$($domain.Domain) 2>&1 | Out-String
+            $dcTestExitCode = $LASTEXITCODE
+            $ErrorActionPreference = $prevEAP
+
+            if ($dcTestExitCode -ne 0) {
+                if ($dcTestOutput -match 'ERROR_NO_SUCH_DOMAIN') {
+                    $problems.Add("Server believes it's joined to domain '$($domain.Domain)', but Windows cannot resolve that domain at all (ERROR_NO_SUCH_DOMAIN - no DNS SRV records found for it). This is not a transient connectivity issue: check the server's DNS server settings (ipconfig /all) point at a DNS server that hosts/forwards for '$($domain.Domain)', and confirm the domain name itself is correct. This also explains the gpupdate and WinRM-over-FQDN failures.")
+                }
+                else {
+                    $problems.Add("Server is domain-joined to '$($domain.Domain)' but cannot locate/reach a domain controller (nltest /dsgetdc failed: $($dcTestOutput.Trim())). This also breaks gpupdate and WinRM-over-FQDN. Fix DNS/network connectivity to a DC before proceeding.")
+                }
             }
             else {
                 Write-Host "    Domain controller reachable for '$($domain.Domain)': OK"
