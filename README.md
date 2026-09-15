@@ -5,13 +5,15 @@ PowerShell script that configures a Windows Server (RD Connection Broker + RD Se
 ## What it does
 
 1. Installs RDS roles (Connection Broker, Session Host, Licensing) if not already present
-2. Enables multiple concurrent sessions per user
-3. Sets session time limits (disconnected / idle / active)
-4. Sets the RemoteApp session logoff delay
-5. Sets the max simultaneous RDS connection count
-6. Creates the `Pbpslaunch` and `PSAutomate` machine environment variables used by Password Safe to launch RemoteApp sessions
-7. Runs `gpupdate /force` to apply the changes
-8. Prints manual follow-up items that are out of scope for automation (RDS licensing/CALs, RDS Collection RemoteApp publishing, load balancer/firewall notes)
+2. Creates the actual RDS session deployment (`New-RDSessionDeployment`) if one doesn't exist yet — installing the Windows features alone does not do this, and Server Manager's RDS Overview page will show "no deployment" until it's created
+3. Creates a `PasswordSafe-<name>` RD Session Collection and publishes `pbpslaunch.exe`, `ps_automate.exe`, and `pbpsmon.exe` as RemoteApps (command-line parameters allowed) for whichever of those actually exist under `-PbpsmonPath`
+4. Enables multiple concurrent sessions per user
+5. Sets session time limits (disconnected / idle / active)
+6. Sets the RemoteApp session logoff delay
+7. Sets the max simultaneous RDS connection count
+8. Creates the `Pbpslaunch` and `PSAutomate` machine environment variables used by Password Safe to launch RemoteApp sessions
+9. Runs `gpupdate /force` to apply the changes
+10. Prints manual follow-up items that are still out of scope for automation (RDS licensing/CALs activation, load balancer/firewall notes)
 
 ## Safety features
 
