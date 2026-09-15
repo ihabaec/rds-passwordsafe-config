@@ -94,6 +94,11 @@ param(
     [ValidateRange(1, 1000)]
     [int]$MinFreeDiskGB = 5,
 
+    # RDS CAL licensing mode to configure on the license server (PerUser or PerDevice).
+    # Must match the CALs you actually purchased - consult your Microsoft licensing agreement.
+    [ValidateSet('PerUser', 'PerDevice')]
+    [string]$LicenseMode = 'PerUser',
+
     # Do not delete this script file after it finishes running. By default the
     # script self-deletes once it completes (registry backups, rollback script,
     # and transcript in -BackupPath are never deleted - only this .ps1 file is).
@@ -254,6 +259,27 @@ if (-not $SkipFeatureInstall) {
     Invoke-Step -Name 'Install RDS-Licensing feature' -Action {
         $f = Get-WindowsFeature -Name RDS-Licensing
         if ($f.Installed) { Write-Host '    Already installed.' } else { Install-WindowsFeature -Name RDS-Licensing -IncludeManagementTools | Out-Null }
+    }
+
+    # Install-WindowsFeature only installs the role binaries - it does NOT create the
+    # RDS "deployment" object that links Broker/Session Host/Licensing together, which
+    # is what Server Manager > Remote Desktop Services > Overview actually checks for.
+    # Without this, session collections/RemoteApp publishing cannot be configured even
+    # though the underlying Windows features report as Installed.
+    Invoke-Step -Name 'Create RDS session deployment (Broker + Session Host + Licensing)' -Action {
+        Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+        $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
+        $existingDeployment = $null
+        try { $existingDeployment = Get-RDServer -ErrorAction Stop } catch {}
+
+        if ($existingDeployment) {
+            Write-Host "    RDS deployment already exists (found $($existingDeployment.Count) role instance(s)) - skipping."
+        }
+        else {
+            New-RDSessionDeployment -ConnectionBroker $fqdn -SessionHost $fqdn -WebAccessServer $fqdn -ErrorAction Stop | Out-Null
+            Add-RDServer -Server $fqdn -Role RDS-LICENSING -ConnectionBroker $fqdn -ErrorAction Stop
+            Set-RDLicenseConfiguration -LicenseServer $fqdn -Mode $LicenseMode -ConnectionBroker $fqdn -Force -ErrorAction Stop
+        }
     }
 }
 else {
