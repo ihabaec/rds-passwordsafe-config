@@ -121,6 +121,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:results = New-Object System.Collections.Generic.List[pscustomobject]
 $script:touchedKeys = New-Object System.Collections.Generic.List[pscustomobject]
+$script:customValues = New-Object System.Collections.Generic.List[pscustomobject]
 $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 
 if ($CollectionName -notmatch '^PasswordSafe-') {
@@ -177,17 +178,51 @@ function Backup-RegistryKey {
 }
 
 function Set-RegistryValue {
+    # Additive/non-destructive by design:
+    #   - value doesn't exist yet          -> set it (nothing lost, pure addition)
+    #   - value exists and already matches -> no-op
+    #   - value exists and equals a known "off"/unconfigured baseline (-OffValues) -> flip it to Value
+    #   - value exists and is something else entirely -> leave it alone, just report it
     param(
         [Parameter(Mandatory)][string]$Path,
         [Parameter(Mandatory)][string]$Name,
         [Parameter(Mandatory)]$Value,
-        [string]$Type = 'DWord'
+        [string]$Type = 'DWord',
+        [object[]]$OffValues = @()
     )
-    Backup-RegistryKey -Path $Path
-    if (-not (Test-Path $Path)) {
-        New-Item -Path $Path -Force | Out-Null
+
+    $current = $null
+    $exists = $false
+    if (Test-Path $Path) {
+        $prop = Get-ItemProperty -Path $Path -Name $Name -ErrorAction SilentlyContinue
+        if ($prop -and ($prop.PSObject.Properties.Name -contains $Name)) {
+            $exists = $true
+            $current = $prop.$Name
+        }
     }
-    New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+
+    if (-not $exists) {
+        Backup-RegistryKey -Path $Path
+        if (-not (Test-Path $Path)) { New-Item -Path $Path -Force | Out-Null }
+        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+        Write-Host "    $Name was not configured - set to $Value."
+        return
+    }
+
+    if ("$current" -eq "$Value") {
+        Write-Host "    $Name already set to $Value - no change needed."
+        return
+    }
+
+    if ($OffValues -contains $current) {
+        Backup-RegistryKey -Path $Path
+        New-ItemProperty -Path $Path -Name $Name -Value $Value -PropertyType $Type -Force | Out-Null
+        Write-Host "    $Name was $current (off/default) - changed to $Value."
+        return
+    }
+
+    Write-Host "    $Name is already customized to $current (not the default/off state) - leaving as-is, NOT overwriting with $Value." -ForegroundColor DarkYellow
+    $script:customValues.Add([pscustomobject]@{ Path = $Path; Name = $Name; CurrentValue = $current; RequestedValue = $Value })
 }
 
 function Invoke-PreflightChecks {
@@ -352,6 +387,17 @@ if (-not $SkipRemoteAppPublish) {
         @{ Alias = 'pbpsmon';     DisplayName = 'PasswordSafe - pbpsmon';     File = 'pbpsmon.exe' }
     )
 
+    # Look across every existing collection (not just $CollectionName) so a pbpsmon
+    # app already published elsewhere - by this script's previous run, or by an admin
+    # manually - is left alone instead of being duplicated in $CollectionName.
+    $allExistingApps = @()
+    try {
+        Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+        foreach ($col in (Get-RDSessionCollection -ErrorAction SilentlyContinue)) {
+            $allExistingApps += @(Get-RDRemoteApp -CollectionName $col.CollectionName -ErrorAction SilentlyContinue)
+        }
+    } catch {}
+
     foreach ($app in $remoteApps) {
         $exePath = Join-Path $PbpsmonPath $app.File
         if (-not (Test-Path $exePath)) {
@@ -359,11 +405,20 @@ if (-not $SkipRemoteAppPublish) {
             continue
         }
 
+        $matchElsewhere = $allExistingApps | Where-Object {
+            $_.Alias -eq $app.Alias -or $_.FilePath -eq $exePath
+        } | Select-Object -First 1
+
+        if ($matchElsewhere) {
+            Write-Host "`n(Skipping RemoteApp publish for $($app.Alias) - already published as '$($matchElsewhere.Alias)' in collection '$($matchElsewhere.CollectionName)', leaving it untouched)" -ForegroundColor DarkYellow
+            continue
+        }
+
         Invoke-Step -Name "Publish RemoteApp: $($app.DisplayName)" -Action {
             Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
             $existingApp = Get-RDRemoteApp -CollectionName $CollectionName -Alias $app.Alias -ErrorAction SilentlyContinue
             if ($existingApp) {
-                Write-Host "    RemoteApp '$($app.Alias)' already published - skipping."
+                Write-Host "    RemoteApp '$($app.Alias)' already published in '$CollectionName' - skipping."
             }
             else {
                 New-RDRemoteApp -CollectionName $CollectionName -Alias $app.Alias -DisplayName $app.DisplayName -FilePath $exePath -CommandLineSetting Allow -ErrorAction Stop | Out-Null
@@ -377,9 +432,9 @@ else {
 
 # 2. Allow multiple concurrent sessions per user
 Invoke-Step -Name 'Allow multiple concurrent RDS sessions per user (fSingleSessionPerUser=0)' -Action {
-    Set-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fSingleSessionPerUser' -Value 0
+    Set-RegistryValue -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name 'fSingleSessionPerUser' -Value 0 -OffValues @(1)
     # Also set the GPO-equivalent policy key so it matches "Restrict... to a single session" = Disabled
-    Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\TerminalServer' -Name 'fSingleSessionPerUser' -Value 0
+    Set-RegistryValue -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\TerminalServer' -Name 'fSingleSessionPerUser' -Value 0 -OffValues @(1)
 }
 
 # 3. Session time limits
@@ -424,17 +479,31 @@ Invoke-Step -Name 'Set maximum number of RDS connections' -Action {
 # 6. Environment variables for pbpslaunch / ps_automate
 Invoke-Step -Name 'Create Pbpslaunch system environment variable' -Action {
     $exe = Join-Path $PbpsmonPath 'pbpslaunch.exe'
-    [Environment]::SetEnvironmentVariable('Pbpslaunch', $exe, 'Machine')
+    $existing = [Environment]::GetEnvironmentVariable('Pbpslaunch', 'Machine')
+    if ($existing) {
+        Write-Host "    Pbpslaunch already set to '$existing' - leaving as-is, NOT overwriting."
+    }
+    else {
+        [Environment]::SetEnvironmentVariable('Pbpslaunch', $exe, 'Machine')
+        Write-Host "    Pbpslaunch was not set - created, pointing at $exe."
+    }
     if (-not (Test-Path $exe)) {
-        Write-Host "    NOTE: $exe does not exist on disk yet (variable set anyway - install pbpsmon/ESA before relying on it)." -ForegroundColor DarkYellow
+        Write-Host "    NOTE: $exe does not exist on disk yet - install pbpsmon/ESA before relying on this variable." -ForegroundColor DarkYellow
     }
 }
 
 Invoke-Step -Name 'Create PSAutomate system environment variable' -Action {
     $exe = Join-Path $PbpsmonPath 'ps_automate.exe'
-    [Environment]::SetEnvironmentVariable('PSAutomate', $exe, 'Machine')
+    $existing = [Environment]::GetEnvironmentVariable('PSAutomate', 'Machine')
+    if ($existing) {
+        Write-Host "    PSAutomate already set to '$existing' - leaving as-is, NOT overwriting."
+    }
+    else {
+        [Environment]::SetEnvironmentVariable('PSAutomate', $exe, 'Machine')
+        Write-Host "    PSAutomate was not set - created, pointing at $exe."
+    }
     if (-not (Test-Path $exe)) {
-        Write-Host "    NOTE: $exe does not exist on disk yet (variable set anyway - install pbpsmon/ESA before relying on it)." -ForegroundColor DarkYellow
+        Write-Host "    NOTE: $exe does not exist on disk yet - install pbpsmon/ESA before relying on this variable." -ForegroundColor DarkYellow
     }
 }
 
@@ -453,6 +522,12 @@ if ($failed) {
 }
 else {
     Write-Host 'All automated steps completed successfully.' -ForegroundColor Green
+}
+
+if ($script:customValues.Count -gt 0) {
+    Write-Host "`n===== EXISTING CUSTOM VALUES LEFT UNTOUCHED (non-destructive) =====" -ForegroundColor Cyan
+    Write-Host "These registry values were already set to something other than the default/off state, so this script did not overwrite them. Review and change manually if they should match Password Safe's requirements." -ForegroundColor Cyan
+    $script:customValues | Format-Table -AutoSize
 }
 
 Write-Host "`n================ MANUAL FOLLOW-UP (not automated) ================" -ForegroundColor Magenta
