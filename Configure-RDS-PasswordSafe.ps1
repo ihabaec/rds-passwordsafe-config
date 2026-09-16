@@ -382,9 +382,14 @@ if (-not $SkipRemoteAppPublish) {
     Invoke-Step -Name "Create RD Session Collection '$CollectionName'" -Action {
         Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
         $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
-        $existing = Get-RDSessionCollection -CollectionName $CollectionName -ErrorAction SilentlyContinue
-        if ($existing) {
-            Write-Host "    Collection '$CollectionName' already exists - skipping."
+        $anyExisting = @(Get-RDSessionCollection -ErrorAction SilentlyContinue)
+        if ($anyExisting.Count -gt 0) {
+            $useCollection = $anyExisting | Where-Object { $_.CollectionName -eq $CollectionName } | Select-Object -First 1
+            if (-not $useCollection) {
+                $useCollection = $anyExisting[0]
+            }
+            $script:CollectionName = $useCollection.CollectionName
+            Write-Host "    An RD Session Collection already exists ('$($useCollection.CollectionName)') - skipping creation and using it instead."
         }
         else {
             New-RDSessionCollection -CollectionName $CollectionName -SessionHost $fqdn -ConnectionBroker $fqdn -CollectionDescription 'BeyondTrust Password Safe application session RemoteApps' -ErrorAction Stop | Out-Null
