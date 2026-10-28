@@ -118,6 +118,21 @@ param(
     [switch]$NoSelfCleanup
 )
 
+# Get-WindowsFeature (ServerManager) and the RD* cmdlets (RemoteDesktop) only exist in
+# 64-bit Windows PowerShell 5.1. Relaunch there if started from x86 PowerShell or pwsh 7.
+$is32on64 = [Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess
+if ($is32on64 -or $PSVersionTable.PSEdition -eq 'Core') {
+    $psExe = if ($is32on64) { "$env:WINDIR\SysNative\WindowsPowerShell\v1.0\powershell.exe" } else { "$env:WINDIR\System32\WindowsPowerShell\v1.0\powershell.exe" }
+    $relaunchArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath)
+    foreach ($p in $PSBoundParameters.GetEnumerator()) {
+        if ($p.Value -is [switch]) { if ($p.Value.IsPresent) { $relaunchArgs += "-$($p.Key)" } }
+        else { $relaunchArgs += "-$($p.Key)"; $relaunchArgs += "$($p.Value)" }
+    }
+    Write-Host "Relaunching in 64-bit Windows PowerShell 5.1 ($psExe)..." -ForegroundColor Yellow
+    & $psExe @relaunchArgs
+    exit $LASTEXITCODE
+}
+
 $ErrorActionPreference = 'Stop'
 $script:results = New-Object System.Collections.Generic.List[pscustomobject]
 $script:touchedKeys = New-Object System.Collections.Generic.List[pscustomobject]
@@ -340,6 +355,7 @@ else {
 
 # 1. Install RDS roles (single-server deployment)
 if (-not $SkipFeatureInstall) {
+    Import-Module ServerManager -ErrorAction SilentlyContinue
     Invoke-Step -Name 'Install RDS-Connection-Broker feature' -Action {
         $f = Get-WindowsFeature -Name RDS-Connection-Broker
         if ($f.Installed) { Write-Host '    Already installed.' } else { Install-WindowsFeature -Name RDS-Connection-Broker -IncludeManagementTools | Out-Null }
@@ -359,7 +375,7 @@ if (-not $SkipFeatureInstall) {
     # Without this, session collections/RemoteApp publishing cannot be configured even
     # though the underlying Windows features report as Installed.
     Invoke-Step -Name 'Create RDS session deployment (Broker + Session Host + Licensing)' -Action {
-        Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+        Import-Module RemoteDesktop -ErrorAction SilentlyContinue
         $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
         $existingDeployment = $null
         try { $existingDeployment = Get-RDServer -ErrorAction Stop } catch {}
@@ -368,6 +384,14 @@ if (-not $SkipFeatureInstall) {
             Write-Host "    RDS deployment already exists (found $($existingDeployment.Count) role instance(s)) - skipping."
         }
         else {
+            # New-RDSessionDeployment talks to the target over WinRM even when it is this
+            # same machine, and fails parameter validation if PS remoting is not enabled.
+            try { Test-WSMan -ComputerName $fqdn -ErrorAction Stop | Out-Null }
+            catch {
+                Write-Host "    WinRM not reachable on $fqdn - running Enable-PSRemoting." -ForegroundColor DarkYellow
+                Enable-PSRemoting -Force -SkipNetworkProfileCheck | Out-Null
+                Test-WSMan -ComputerName $fqdn -ErrorAction Stop | Out-Null
+            }
             New-RDSessionDeployment -ConnectionBroker $fqdn -SessionHost $fqdn -WebAccessServer $fqdn -ErrorAction Stop | Out-Null
             Add-RDServer -Server $fqdn -Role RDS-LICENSING -ConnectionBroker $fqdn -ErrorAction Stop
             Set-RDLicenseConfiguration -LicenseServer $fqdn -Mode $LicenseMode -ConnectionBroker $fqdn -Force -ErrorAction Stop
@@ -380,7 +404,7 @@ else {
 
 if (-not $SkipRemoteAppPublish) {
     Invoke-Step -Name "Create RD Session Collection '$CollectionName'" -Action {
-        Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+        Import-Module RemoteDesktop -ErrorAction SilentlyContinue
         $fqdn = [System.Net.Dns]::GetHostEntry($env:COMPUTERNAME).HostName
         $anyExisting = @(Get-RDSessionCollection -ErrorAction SilentlyContinue)
         if ($anyExisting.Count -gt 0) {
@@ -409,7 +433,7 @@ if (-not $SkipRemoteAppPublish) {
     # manually - is left alone instead of being duplicated in $CollectionName.
     $allExistingApps = @()
     try {
-        Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+        Import-Module RemoteDesktop -ErrorAction SilentlyContinue
         foreach ($col in (Get-RDSessionCollection -ErrorAction SilentlyContinue)) {
             $allExistingApps += @(Get-RDRemoteApp -CollectionName $col.CollectionName -ErrorAction SilentlyContinue)
         }
@@ -432,7 +456,7 @@ if (-not $SkipRemoteAppPublish) {
         }
 
         Invoke-Step -Name "Publish RemoteApp: $($app.DisplayName)" -Action {
-            Import-Module RemoteDesktopServices -ErrorAction SilentlyContinue
+            Import-Module RemoteDesktop -ErrorAction SilentlyContinue
             $existingApp = Get-RDRemoteApp -CollectionName $CollectionName -Alias $app.Alias -ErrorAction SilentlyContinue
             if ($existingApp) {
                 Write-Host "    RemoteApp '$($app.Alias)' already published in '$CollectionName' - skipping."
