@@ -369,6 +369,19 @@ if (-not $SkipFeatureInstall) {
         if ($f.Installed) { Write-Host '    Already installed.' } else { Install-WindowsFeature -Name RDS-Licensing -IncludeManagementTools | Out-Null }
     }
 
+    # A freshly installed role sits in InstallPending until reboot. The pre-flight
+    # RebootPending check does not see this, and New-RDSessionDeployment then fails
+    # with "Unable to connect to the server by using Windows PowerShell remoting".
+    $pendingFeatures = @(Get-WindowsFeature -Name RDS-Connection-Broker, RDS-RD-Server, RDS-Licensing |
+        Where-Object { $_.InstallState -eq 'InstallPending' })
+    if ($pendingFeatures.Count -gt 0) {
+        Write-Host "`n!! Reboot required: $($pendingFeatures.Name -join ', ') pending install. Restart this server, then re-run the script to create the RDS deployment and publish the RemoteApps." -ForegroundColor Yellow
+        foreach ($stepName in @('Create RDS session deployment (Broker + Session Host + Licensing)', "Create RD Session Collection '$CollectionName'", 'Publish RemoteApps')) {
+            $script:results.Add([pscustomobject]@{ Step = $stepName; Status = 'SKIPPED (reboot required)'; Detail = '' })
+        }
+        $SkipRemoteAppPublish = $true
+    }
+    else {
     # Install-WindowsFeature only installs the role binaries - it does NOT create the
     # RDS "deployment" object that links Broker/Session Host/Licensing together, which
     # is what Server Manager > Remote Desktop Services > Overview actually checks for.
@@ -396,6 +409,7 @@ if (-not $SkipFeatureInstall) {
             Add-RDServer -Server $fqdn -Role RDS-LICENSING -ConnectionBroker $fqdn -ErrorAction Stop
             Set-RDLicenseConfiguration -LicenseServer $fqdn -Mode $LicenseMode -ConnectionBroker $fqdn -Force -ErrorAction Stop
         }
+    }
     }
 }
 else {
